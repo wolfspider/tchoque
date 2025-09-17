@@ -161,6 +161,31 @@ extern "C" {
 
 #define PICOQUIC_RESERVED_IF_INDEX 0x09cb8ed3 /* First 4 bytes of SHA256("QUIC Masque") */
 
+/* ==== Cheshire SBM: header additions =================================== */
+
+#ifndef PICOQUIC_SBM
+#define PICOQUIC_SBM 1
+#endif
+
+/* (Place near other error codes) */
+#ifndef PICOQUIC_ERROR_SBM_WOULD_BLOCK
+#define PICOQUIC_ERROR_SBM_WOULD_BLOCK  (-29001) /* app should retry later */
+#endif
+
+/* Forward decl */
+struct st_picoquic_cnx_t;
+struct st_picoquic_path_t;
+
+/* API */
+void picoquic_sbm_enable(struct st_picoquic_cnx_t* cnx, int enable);
+void picoquic_sbm_set_replenish_time_ms(struct st_picoquic_cnx_t* cnx, uint32_t ms);
+void picoquic_sbm_set_max_unsent_bytes(struct st_picoquic_cnx_t* cnx, uint64_t bytes);
+
+/* Compute allowed unsent budget (bytes) at this instant. */
+uint64_t picoquic_sbm_budget_bytes(struct st_picoquic_cnx_t* cnx,
+                                   struct st_picoquic_path_t* path);
+
+
 
 /*
 * Connection states, useful to expose the state to the application.

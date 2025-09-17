@@ -57,7 +57,7 @@
 #endif
 
 static const int default_server_port = 4443;
-static const char* default_server_name = "::";
+static const char* default_server_name = "localhost";
 static const char* ticket_store_filename = "demo_ticket_store.bin";
 static const char* token_store_filename = "demo_token_store.bin";
 
@@ -308,6 +308,8 @@ int quic_server(const char* server_name, picoquic_quic_config_t * config, int ju
         if (ret == 0 && config->token_file_name == NULL) {
             ret = picoquic_config_set_option(config, picoquic_option_Token_File_Name, token_store_filename);
         }
+        //Web server callback:
+        //h3zero_callback
         if (ret == 0) {
             qserver = picoquic_create_and_configure(config, picoquic_demo_server_callback, &picoquic_file_param, current_time, NULL);
             if (qserver == NULL) {

@@ -1546,6 +1546,33 @@ typedef struct st_picoquic_cnx_t {
     picoquic_stateless_packet_t* first_sooner;
     picoquic_stateless_packet_t* last_sooner;
 
+#if PICOQUIC_SBM
+    /* Total bytes currently queued in user-space (not yet copied into a packet). */
+    uint64_t sbm_unsent_bytes;
+
+    /* Hard cap (0 = disabled). If non-zero, budget = min(time_budget, hard cap). */
+    uint64_t sbm_max_unsent_bytes;
+
+    /* Time-based replenish window in ms (default e.g. 25ms). */
+    uint32_t sbm_replenish_time_ms;
+
+    /* 0 = off (default), 1 = on */
+    uint8_t  sbm_enabled;
+
+    uint64_t sbm_remaining_bytes_tick;
+
+    uint64_t sbm_next_replenish_time;    // NEW: next time we can refill
+    uint32_t sbm_replenish_interval_us;  // e.g. 10_000us (10 ms) or whatever you chos
+
+    /* Token-bucket state */
+    uint64_t sbm_tokens;                 /* current tokens (bytes) available for fresh app data */
+    uint64_t sbm_bucket_max;             /* cap for tokens (bytes) */
+    uint64_t sbm_last_refill_time;       /* time in µs when we last refilled */
+    uint64_t sbm_rate_bytes_per_us;      /* steady refill rate in bytes per microsecond */
+    uint64_t sbm_last_stall_time;
+    uint32_t sbm_stall_spins;
+#endif
+
     /* Log handling */
     uint16_t log_unique;
     FILE* f_binlog;
@@ -1553,6 +1580,94 @@ typedef struct st_picoquic_cnx_t {
     void (*memlog_call_back)(picoquic_cnx_t* cnx, picoquic_path_t* path, void* v_memlog, int op_code, uint64_t current_time);
     void *memlog_ctx;
 } picoquic_cnx_t;
+
+/* ---- epoch/ptype plumbing (works across older/newer picoquic trees) ---- */
+#ifndef HAVE_PICOQUIC_EPOCH_ENUMS
+#  define picoquic_epoch_initial      0
+#  define picoquic_epoch_0rtt         1
+#  define picoquic_epoch_handshake    2
+#  define picoquic_epoch_1rtt         3
+#endif
+
+/* If you only have packet types, map them to epochs here (adjust if names differ): */
+static inline int picoquic_ptype_to_epoch(int ptype)
+{
+    /* Typical mapping in picoquic:
+       initial=0, 0rtt=1, handshake=2, 1rtt=3. Keep this in sync with your tree. */
+    return ptype;
+}
+
+/* ---- connection-level: “are we in app phase?” (now includes client 0-RTT) ---- */
+static inline int picoquic_sbm_in_app_phase(const picoquic_cnx_t* cnx)
+{
+    /* 1-RTT encryption context present? */
+#if defined(picoquic_epoch_1rtt)
+    const int have_1rtt_tx = (cnx->crypto_context[picoquic_epoch_1rtt].aead_encrypt != NULL);
+#else
+    const int have_1rtt_tx = (cnx->crypto_context[3].aead_encrypt != NULL);
+#endif
+
+    /* READY states; clients can start earlier at client_ready_start */
+#if defined(picoquic_state_ready)
+    const int is_ready_server = (cnx->cnx_state == picoquic_state_ready ||
+                                 cnx->cnx_state == picoquic_state_server_ready);
+    const int is_ready_client = (cnx->cnx_state == picoquic_state_ready ||
+                                 cnx->cnx_state == picoquic_state_client_ready ||
+                                 cnx->cnx_state == picoquic_state_client_ready_start);
+#else
+    const int is_ready_server = 0, is_ready_client = 0;
+#endif
+
+    if ((cnx->client_mode ? is_ready_client : is_ready_server) && have_1rtt_tx) {
+        return 1; /* app phase after 1-RTT keys + appropriate ready state */
+    }
+
+    /* ---- 0-RTT strictly opt-in ---- */
+#if defined(picoquic_epoch_0rtt)
+    //const int have_0rtt_tx = (cnx->client_mode &&
+    //                          cnx->crypto_context[picoquic_epoch_0rtt].aead_encrypt != NULL);
+#else
+    const int have_0rtt_tx = 0;
+#endif
+
+#if defined(HAVE_PICOQUIC_ZRTT_FLAGS)
+    /* Adjust field names to your tree if different */
+    const int z_attempted = cnx->zero_rtt_attempted;
+    const int z_accepted  = (cnx->zero_rtt_data_accepted || cnx->zero_rtt_accepted);
+    if (cnx->client_mode && z_attempted && z_accepted && have_0rtt_tx) return 1;
+#endif
+
+    return 0;
+}
+
+
+
+
+/* ---- per-packet: should SBM apply to this packet type? ----
+   Initial + Handshake: NO (bypass)
+   0-RTT:                YES if client has 0-RTT keys
+   1-RTT:                YES if app phase (as above)
+*/
+static inline int picoquic_sbm_should_run_for_ptype(const picoquic_cnx_t* cnx, int ptype)
+{
+    int epoch = picoquic_ptype_to_epoch(ptype);
+
+    if (epoch == picoquic_epoch_initial || epoch == picoquic_epoch_handshake) {
+        return 0; /* explicitly bypass SBM for Initial/Handshake packets */
+    }
+    if (epoch == picoquic_epoch_0rtt) {
+#if defined(picoquic_epoch_0rtt)
+        return (cnx->client_mode &&
+                cnx->crypto_context[picoquic_epoch_0rtt].aead_encrypt != NULL);
+#else
+        return (cnx->client_mode && cnx->crypto_context[1].aead_encrypt != NULL);
+#endif
+    }
+    /* 1-RTT */
+    return picoquic_sbm_in_app_phase(cnx);
+}
+
+
 
 typedef struct st_picoquic_packet_data_t {
     uint64_t last_time_stamp_received;

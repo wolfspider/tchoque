@@ -1661,6 +1661,8 @@ int picoquic_set_first_if_index(picoquic_cnx_t* cnx, unsigned long if_index)
     return ret;
 }
 
+
+
 /* Path management -- returns the index of the path that was created. */
 int picoquic_create_path(picoquic_cnx_t* cnx, uint64_t start_time, const struct sockaddr* local_addr,
     const struct sockaddr* peer_addr, int if_index, uint64_t requested_id)
@@ -3928,6 +3930,30 @@ picoquic_cnx_t* picoquic_create_cnx(picoquic_quic_t* quic,
 
         /* Initialize the stream data repeat queue */
         picoquic_queue_data_repeat_init(cnx);
+        
+#if PICOQUIC_SBM
+        uint64_t init_mtu =
+#ifdef PICOQUIC_ENFORCED_INITIAL_MTU
+                PICOQUIC_ENFORCED_INITIAL_MTU;
+#else
+        1200; /* QUIC v1 min size */
+#endif
+        cnx->sbm_enabled = 0;
+        cnx->sbm_replenish_time_ms = 0; /* set when enabling */
+        cnx->sbm_max_unsent_bytes = 0;
+        cnx->sbm_unsent_bytes = 0;
+        cnx->sbm_remaining_bytes_tick = 0;
+        cnx->sbm_next_replenish_time  = picoquic_current_time();  // or current_time passed in
+        cnx->sbm_replenish_interval_us = 10*1000; // example 10 ms
+        cnx->sbm_bucket_max = 4 * init_mtu;   /* ~4 MTUs worth of fresh app bytes */
+        cnx->sbm_tokens     = 2 * init_mtu;   /* decent default; we’ll update live below */
+        cnx->sbm_last_refill_time = picoquic_current_time(); /* µs */
+        cnx->sbm_rate_bytes_per_us = 0; /* will be set from cwnd/rtt/pacing */
+        cnx->sbm_unsent_bytes = 0;
+        cnx->sbm_remaining_bytes_tick = 0;
+#endif
+
+        picoquic_sbm_enable(cnx, 1);
 
         /* Initialize the connection ID stash */
         ret = picoquic_create_path(cnx, start_time, NULL, addr_to, 0, 0);

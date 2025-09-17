@@ -1441,6 +1441,18 @@ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, pic
                 }
             }
         }
+#if PICOQUIC_SBM
+        if (cnx->sbm_enabled && stream->is_active) {
+            size_t allowed = (size_t) cnx->sbm_remaining_bytes_tick;
+            if (allowed == 0) {
+                /* Hard Cheshire: skip fetching fresh app data this round */
+                stream = next_stream; /* your local label / flow */
+                continue;
+            }
+
+            //if (stream->maxdata_remote > allowed) stream->maxdata_remote = allowed; /* clamp the hint */
+        }
+#endif
         stream = next_stream;
     }
 
@@ -1697,10 +1709,27 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
         uint8_t* bytes0 = bytes;
         size_t byte_index = 0;
         size_t length = 0;
+        size_t payload_len = 0;      /* what we actually sent in this frame */
+        int from_buffer = 0;         /* did we pull from send_queue? */
+
+        const int sbm_app_now =
+#if PICOQUIC_SBM
+                (cnx->sbm_enabled && picoquic_sbm_in_app_phase(cnx));
+#else
+        0;
+#endif
+
 
         if ((bytes = picoquic_format_stream_frame_header(bytes, bytes_max, stream->stream_id, stream->sent_offset)) == NULL) {
             bytes = bytes0;
-            *more_data = 1;
+            if (more_data) *more_data = 1;
+#if PICOQUIC_SBM
+            if (cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
+                /* We couldn’t place data now: stop trying this tick */
+                cnx->sbm_remaining_bytes_tick = 0;
+            }
+#endif
+            goto stream_done;
         } else {
             /* Compute the length */
             size_t byte_space = bytes_max - bytes;
@@ -1718,6 +1747,39 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
             if (allowed_space > (cnx->maxdata_remote - cnx->data_sent)) {
                 allowed_space = (size_t)(cnx->maxdata_remote - cnx->data_sent);
             }
+
+            /* If FC says zero, don’t emit a header-only STREAM */
+            if (allowed_space == 0) {
+                bytes = bytes0;
+                if (more_data) *more_data = 1;
+#if PICOQUIC_SBM
+                if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
+                    /* We couldn’t place data now: stop trying this tick */
+                    cnx->sbm_remaining_bytes_tick = 0;
+                }
+#endif
+                goto stream_done;
+            }
+
+            /* === CHESHIRE: cap by per-tick allowance for fresh app bytes === */
+#if PICOQUIC_SBM
+            if (sbm_app_now) {
+                if (cnx->sbm_enabled) {
+                    uint64_t allow = cnx->sbm_remaining_bytes_tick;
+                    if (allow == 0) {
+                        /* Don’t emit a STREAM frame header-only; drop it and try later */
+                        bytes = bytes0;
+                        if (more_data) *more_data = 1;
+                        goto stream_done;
+                    }
+                    if (allowed_space > allow) {
+                        allowed_space = (size_t) allow;
+                    }
+                }
+            }
+#endif
+            /* === end cap === */
+
 
             if (stream->is_active && stream->send_queue == NULL && !stream->fin_requested) {
                 /* The application requested active polling for this stream */
@@ -1738,11 +1800,26 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                     *ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0,
                         "Prepare to send callback");
                     bytes = bytes0; /* CHECK: SHOULD THIS BE NULL ? */
+#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
+                        /* We couldn’t place data now: stop trying this tick */
+                        cnx->sbm_remaining_bytes_tick = 0;
+                    }
+#endif
+                    goto stream_done;
                 }
                 else if (stream_data_context.length == 0 && stream_data_context.is_fin == 0) {
                     /* The application did not send any data */
                     bytes = bytes0;
                     stream->is_active = stream_data_context.is_still_active;
+                    if (more_data) *more_data = 1;
+#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
+                        /* We couldn’t place data now: stop trying this tick */
+                        cnx->sbm_remaining_bytes_tick = 0;
+                    }
+#endif
+                    goto stream_done;
                 }
                 else
                 {
@@ -1818,6 +1895,9 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                     stream->sent_offset += length;
                     stream->last_time_data_sent = picoquic_get_quic_time(cnx->quic);
                     cnx->data_sent += length;
+
+                    payload_len = length;   /* buffered bytes framed */
+                    from_buffer = 1;
                 }
 
                 bytes = bytes0 + byte_index;
@@ -1835,7 +1915,14 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                 else if (length == 0) {
                     /* No point in sending a silly packet */
                     bytes = bytes0;
-                    *more_data = 1;
+                    if (more_data) *more_data = 1;
+#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
+                        /* We couldn’t place data now: stop trying this tick */
+                        cnx->sbm_remaining_bytes_tick = 0;
+                    }
+#endif
+                    goto stream_done;
                 }
             }
         }
@@ -1849,6 +1936,32 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                 cnx->sent_blocked_frame = 0;
             }
         }
+
+        stream_done:
+        /* === CHESHIRE: spend per-tick allowance; shrink unsent only for buffered === */
+#if PICOQUIC_SBM
+        if (cnx->sbm_enabled && payload_len > 0) {
+            if (cnx->sbm_remaining_bytes_tick >= payload_len)
+                cnx->sbm_remaining_bytes_tick -= payload_len;
+            else
+                cnx->sbm_remaining_bytes_tick = 0;
+
+            if (from_buffer) { /* DO NOT touch sbm_unsent_bytes for JIT */
+                if (cnx->sbm_unsent_bytes >= payload_len)
+                    cnx->sbm_unsent_bytes -= payload_len;
+                else
+                    cnx->sbm_unsent_bytes = 0;
+            }
+
+            /* Optional debug:*/
+            DBG_PRINTF("[SBM/FRAME-] stream=%" PRIu64 " len=%zu rem=%llu unsent=%llu\n",
+                (uint64_t)stream->stream_id, (size_t)payload_len,
+                (unsigned long long)cnx->sbm_remaining_bytes_tick,
+                (unsigned long long)cnx->sbm_unsent_bytes);
+
+        }
+#endif
+        /* === end === */
     }
 
     return bytes;
