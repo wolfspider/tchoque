@@ -8,7 +8,7 @@ This repo hosts tchoque (lousiana french for "blackbird" pronounced like the wor
 
 It also stands for:
 
-# The CHeshire Over Quic Experiment
+# The CHeshire Over QUic Experiment
 
 This is an implementation of IETF draft-cheshire-sbm-02
 which can be found here:
