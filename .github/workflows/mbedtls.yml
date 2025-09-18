@@ -39,7 +39,7 @@ jobs:
              make
              echo "compiled MbedTLS"
              pwd
-             cd ../../picoquic
+             cd ../../tchoque
 
       - name: Building picoquic
         run: |
