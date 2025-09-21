@@ -1,4 +1,67 @@
-# picoquic
+# picoquic / tchoque
+
+This repo hosts tchoque (lousiana french for "blackbird" pronounced like the word "chalk")
+ 
+# [codename: Blackbird]
+
+![BLACKBIRD](media/Blackbird.jpeg)
+
+It also stands for:
+
+# The CHeshire Over QUic Experiment
+
+This is an implementation of IETF draft-cheshire-sbm-02
+which can be found here:
+[Source Buffer Management](https://www.ietf.org/archive/id/draft-cheshire-sbm-02.html)
+
+I decided to Jackson Pollock my way through the draft and so this does not use de-facto pacing.
+This is referred to colloquially as HARD tchoque.
+
+To actually run this on a platform like linux you would need to build picoquicdemo and do the following(?):
+
+```terminal
+sudo ./picoquicdemo -r -M -p 443 -w ./htdocs -c /certs/localhost.pem -k /certs/localhost-key.pem
+```
+Due to service discovery being a janky business on browsers I've found the easiest thing to do is actually
+start Wireshark as sudo for your main adapter. Afterwards, you can test if you are actually receiving QUIC
+from a site like https://http3.is
+
+This whole affair should make you begin to question things, as you should, or perhaps this is not necessary on
+your platform of choice.
+
+Once this is verified you can start Chrome (still working on getting FF working...) like this:
+
+```terminal
+google-chrome --enable-quic --quic-version=h3-29 --origin-to-force-quic-on=localhost:443 --ignore-certificate-errors
+```
+Probably all of that is not necessary but the response header from your H3 server should show up. Try some video and watch Wireshark
+with the quic filter on and then you can see packets flowing from your QUIC server.
+
+Tests should emit SBM counters to monitor allowances for buffer management and so these tunables have been put into the internal header files.
+While running unit tests you should see output like this indicating that it is working:
+
+```terminal
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=9997639 tokens=7612 rem=7612 headroom=30448 rate=1000000B/s cwin=30448 rtt_us=20391
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=10000045 tokens=7612 rem=7612 headroom=30448 rate=1000000B/s cwin=30448 rtt_us=20391
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=10000587 tokens=7612 rem=7612 headroom=30448 rate=1000000B/s cwin=30448 rtt_us=20391
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=10000587 tokens=7612 rem=7612 headroom=30448 rate=1000000B/s cwin=30448 rtt_us=20391
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=10002327 tokens=11520 rem=11520 headroom=46316 rate=1000000B/s cwin=46316 rtt_us=23752
+
+oquic/picoquic/sender.c:4246 [picoquic_prepare_packet_ex]: [SBM/TICK] t=10012378 tokens=7612 rem=7612 headroom=30448 rate=1000000B/s cwin=30448 rtt_us=20391
+
+icoquictest/mediatest.c:975 [mediatest_is_finished]: Media transmission finished at 10022421
+    Success.
+quic/picoquic/tls_api.c:149 [picoquic_tls_api_init_providers]: Unloading minicrypto
+quic/picoquic/tls_api.c:154 [picoquic_tls_api_init_providers]: Unloading openssl
+quic/picoquic/tls_api.c:165 [picoquic_tls_api_init_providers]: Unloading fusion
+```
+
+# Picoquic Docs
 
 Minimalist implementation of the QUIC protocol, as defined by the IETF.
 The IETF spec started with the version of QUIC defined by Google and
