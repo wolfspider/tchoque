@@ -1834,6 +1834,16 @@ int picoquic_incoming_0rtt(
             /* Accept the incoming frames */
             if (ph->payload_length == 0) {
                 /* empty payload! */
+#if PICOQUIC_SBM
+                if (cnx->sbm_enabled) {
+                    /* Under SBM we may legitimately see header-only 0-RTT packets (coalescing/pacing artifacts).
+                       Ignore them instead of faulting the connection. */
+                    cnx->nb_zero_rtt_received++;  /* optional: keep stats symmetry */
+                    DBG_PRINTF("[SBM/0-RTT] empty payload ignored (pn=%" PRIu64 ")\n", ph->pn64);
+                    return 0; /* Do not call the decoder or TLS here */
+                }
+#endif
+                /* Non-SBM (or SBM disabled): keep the original strict behavior */
                 ret = picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION, 0);
             }
             else {

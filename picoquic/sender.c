@@ -94,7 +94,7 @@ static inline uint64_t picoquic_sbm_pacing_Bps(picoquic_cnx_t *cnx, struct st_pi
 
 uint64_t picoquic_sbm_budget_bytes(picoquic_cnx_t *cnx, struct st_picoquic_path_t *path) {
 #if PICOQUIC_SBM
-    if (!cnx || !cnx->sbm_enabled) return UINT64_MAX;
+    if (!cnx || !cnx->sbm_enabled) return SBM_INF;
 
     /* Time-based budget: pacing_rate * window_time */
     uint64_t rate_Bps = picoquic_sbm_pacing_Bps(cnx, path);
@@ -110,7 +110,10 @@ uint64_t picoquic_sbm_budget_bytes(picoquic_cnx_t *cnx, struct st_picoquic_path_
         budget = PICOQUIC_MIN(budget, cnx->sbm_max_unsent_bytes);
     }
     /* Never return 0 to avoid total stall (let app drip a packet’s worth) */
-    if (budget < 1200) budget = 1200; /* min 1-ish MTU */
+    {
+                    size_t min_pkt = (path && path->send_mtu) ? path->send_mtu : 1200;
+                    if (budget < min_pkt) budget = min_pkt;
+    }
     return budget;
 #else
     (void)cnx; (void)path;
@@ -123,16 +126,31 @@ static inline size_t picoquic_sbm_allowed_now(picoquic_cnx_t *cnx,
                                               picoquic_path_t *path,
                                               size_t cap) {
 #if PICOQUIC_SBM
-    if (!cnx->sbm_enabled) return cap;
-    uint64_t budget = picoquic_sbm_budget_bytes(cnx, path);   /* you already have this */
-    int64_t remaining = (int64_t) budget - (int64_t) cnx->sbm_unsent_bytes;
-    if (remaining <= 0) return 0;
-    if ((uint64_t) cap > (uint64_t) remaining) cap = (size_t) remaining;
-    return cap;
+       if (!cnx->sbm_enabled) return cap;
+        /* Refill elsewhere once per tick; here we only spend what's left this tick. */
+                uint64_t tokens = cnx->sbm_remaining_bytes_tick;
+        /* (optional, but nice) also respect cwnd headroom for this packet: */
+        if (path) {
+                uint64_t cwnd_room = (path->bytes_in_transit < path->cwin) ? (path->cwin - path->bytes_in_transit) : 0;
+                if (tokens > cwnd_room) tokens = cwnd_room;
+            }
+        if (tokens == 0) return 0;
+        if (cap > tokens) cap = (size_t)tokens;
+        return cap;
 #else
     (void)cnx; (void)path; return cap;
 #endif
 }
+
+static inline int picoquic_datagrams_pending_globally(const picoquic_cnx_t* cnx)
+{
+    if (cnx->first_datagram != NULL || cnx->is_datagram_ready) return 1;
+    for (int i = 0; i < cnx->nb_paths; i++) {
+        if (cnx->path[i] != NULL && cnx->path[i]->is_datagram_ready) return 1;
+    }
+    return 0;
+}
+
 
 static picoquic_stream_head_t* picoquic_find_stream_for_writing(picoquic_cnx_t* cnx,
     uint64_t stream_id, int * ret)
@@ -325,25 +343,18 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
             }
         } else {
             stream->fin_requested = 1;
+           //cnx->sbm_fin_requested = 1;
         }
+        //cnx->sbm_enabled = 1;
     }
 
 #if PICOQUIC_SBM
     if (ret == 0 && cnx->sbm_enabled && length > 0 && picoquic_sbm_in_app_phase(cnx)) {
         /* Gate *enqueue* using a dedicated backlog cap, not the on-wire budget. */
-        uint64_t max_unsent = cnx->sbm_max_unsent_bytes;
-        if (max_unsent == 0) {
-            /* 0 means unlimited backlog for compatibility with existing tests/apps */
-            max_unsent = UINT64_MAX;
-        }
-        if (cnx->sbm_unsent_bytes >= max_unsent) {
-            /* Don’t grow the user-space queue beyond the cap. The caller can retry later. */
-            // Optional debug:
-            DBG_PRINTF("[SBM/ENQ-BLOCK] sid=%" PRIu64 " unsent=%llu max=%llu len=%zu\n",
-                     stream_id, (unsigned long long)cnx->sbm_unsent_bytes,
-                     (unsigned long long)max_unsent, length);
-            return PICOQUIC_ERROR_SBM_WOULD_BLOCK;
-        }
+        uint64_t max_unsent = cnx->sbm_max_unsent_bytes ? cnx->sbm_max_unsent_bytes : SBM_INF;
+                if (!sbm_is_inf(max_unsent) && cnx->sbm_unsent_bytes + length > max_unsent) {
+                        return PICOQUIC_ERROR_SBM_WOULD_BLOCK;
+                }
         /* We’ll clamp the accounting addition below to avoid overflow and respect max_unsent. */
     }
 #endif
@@ -378,26 +389,14 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t* cnx, uint64_t stream_id,
                 *pprev = stream_data;
 
 #if PICOQUIC_SBM
-                if (cnx->sbm_enabled) {
+                if (cnx->sbm_enabled && picoquic_sbm_in_app_phase(cnx)) {
                     /* Account backlog growth here (this is what headroom compares against). */
-                    uint64_t max_unsent = cnx->sbm_max_unsent_bytes;
-                    if (max_unsent == 0) max_unsent = UINT64_MAX;
-
-                    /* clamp addition to avoid overflow and to respect the max cap */
-                    uint64_t room = (cnx->sbm_unsent_bytes < max_unsent)
-                                    ? (max_unsent - cnx->sbm_unsent_bytes)
-                                    : 0;
-                    uint64_t add = length;
-                    if (add > room) add = room;
-                    if (UINT64_MAX - cnx->sbm_unsent_bytes < add) add = UINT64_MAX - cnx->sbm_unsent_bytes;
-
-                    cnx->sbm_unsent_bytes += add;
+                    cnx->sbm_unsent_bytes += length;
 
                     // Optional debug:
-                    DBG_PRINTF("[SBM/ENQ] sid=%" PRIu64 " +%zu -> unsent=%llu (max=%llu)\n",
+                    DBG_PRINTF("[SBM/ENQ] sid=%" PRIu64 " +%zu -> unsent=%llu\n",
                              stream_id, length,
-                             (unsigned long long)cnx->sbm_unsent_bytes,
-                             (unsigned long long)max_unsent);
+                             (unsigned long long)cnx->sbm_unsent_bytes);
                 }
 #endif
             }
@@ -1081,15 +1080,15 @@ size_t picoquic_protect_packet(picoquic_cnx_t* cnx,
     /* Next, encrypt the PN -- The sample is located after the pn_offset */
     picoquic_protect_packet_header(send_buffer, pn_offset, first_mask, pn_enc);
 
-#if PICOQUIC_SBM
+/*#if PICOQUIC_SBM
     if (cnx->sbm_enabled && send_length > 0) {
-        /* Left the "unsent" pool and also spent from this tick's allowance */
+        *//* Left the "unsent" pool and also spent from this tick's allowance *//*
         cnx->sbm_unsent_bytes =
                 (cnx->sbm_unsent_bytes >= send_length) ? (cnx->sbm_unsent_bytes - send_length) : 0;
         cnx->sbm_remaining_bytes_tick =
                 (cnx->sbm_remaining_bytes_tick >= send_length) ? (cnx->sbm_remaining_bytes_tick - send_length) : 0;
     }
-#endif
+#endif*/
 
     return send_length;
 }
@@ -1285,7 +1284,7 @@ void picoquic_finalize_and_protect_packet_tuple(picoquic_cnx_t* cnx,
 
     if (ret == 0 && length > 0) {
         packet->length = length;
-        
+
         if (packet->ptype == picoquic_packet_1rtt_protected && cnx->is_multipath_enabled) {
             packet->sequence_number = path_x->pkt_ctx.send_sequence++;
         } else {
@@ -1360,18 +1359,24 @@ void picoquic_finalize_and_protect_packet_tuple(picoquic_cnx_t* cnx,
     }
 
 
-    size_t pulled = *send_length; /* the exact number copied */
+    //size_t pulled = *send_length; /* the exact number copied */
 
-#if PICOQUIC_SBM
-    if (cnx->sbm_enabled && pulled > 0) {
+/*#if PICOQUIC_SBM
+    if (cnx->sbm_enabled
+        && picoquic_sbm_in_app_phase(cnx)
+        && packet->pc == picoquic_packet_context_application
+    && pulled > 0) {
         if (cnx->sbm_unsent_bytes >= pulled) {
             cnx->sbm_unsent_bytes -= pulled;
         } else {
-            cnx->sbm_unsent_bytes = 0; /* safety */
+            cnx->sbm_unsent_bytes = 0; *//* safety *//*
         }
 
+        if (cnx->sbm_remaining_bytes_tick >= pulled) cnx->sbm_remaining_bytes_tick -= pulled;
+        else cnx->sbm_remaining_bytes_tick = 0;
+
     }
-#endif
+#endif*/
 }
 
 void picoquic_finalize_and_protect_packet(picoquic_cnx_t* cnx,
@@ -1760,6 +1765,18 @@ size_t picoquic_prepare_mtu_probe(picoquic_cnx_t* cnx,
     return probe_length - checksum_length;
 }
 
+#if PICOQUIC_SBM
+static inline void picoquic_sbm_maybe_replenish(picoquic_cnx_t* cnx, picoquic_path_t* path, uint64_t now)
+{
+    if (!cnx->sbm_enabled) return;
+    if (cnx->sbm_next_replenish_time == 0 || now >= cnx->sbm_next_replenish_time) {
+        cnx->sbm_remaining_bytes_tick = picoquic_sbm_budget_bytes(cnx, path);
+        cnx->sbm_next_replenish_time  = now + (uint64_t)cnx->sbm_replenish_time_ms * 1000ull;
+        cnx->sbm_pacing_blocked_hint  = (cnx->sbm_remaining_bytes_tick == 0);
+    }
+}
+#endif
+
 /* Prepare the next packet to 0-RTT packet to send in the client initial
  * state, when 0-RTT is available
  */
@@ -1779,6 +1796,10 @@ int picoquic_prepare_packet_0rtt(picoquic_cnx_t* cnx, picoquic_path_t * path_x, 
     int more_data = 0;
     int is_pure_ack = 1;
     int stream_tried_and_failed = 0;
+
+#if PICOQUIC_SBM
+    picoquic_sbm_maybe_replenish(cnx, path_x, current_time);
+#endif
 
     send_buffer_max = (send_buffer_max > path_x->send_mtu) ? path_x->send_mtu : send_buffer_max;
     if (path_x->bytes_in_transit + send_buffer_max > PICOQUIC_DEFAULT_0RTT_WINDOW) {
@@ -1821,8 +1842,23 @@ int picoquic_prepare_packet_0rtt(picoquic_cnx_t* cnx, picoquic_path_t * path_x, 
         }
 
         /* Encode the stream frame, or frames */
-        bytes_next = picoquic_format_available_stream_frames(cnx, NULL, bytes_next, bytes_max, UINT64_MAX,
-            &more_data, &is_pure_ack, &stream_tried_and_failed, &ret);
+#if PICOQUIC_SBM
+        if (cnx->sbm_enabled) {
+            size_t cap = picoquic_sbm_allowed_now(cnx, path_x, (size_t)(bytes_max - bytes_next));
+            if (cap == 0) {
+                /* skip app write this packet */
+            } else {
+                uint8_t* app_bytes_max = bytes_next + cap;
+                bytes_next = picoquic_format_available_stream_frames(cnx, NULL, bytes_next, app_bytes_max, UINT64_MAX,
+                                                                     &more_data, &is_pure_ack, &stream_tried_and_failed, &ret);
+            }
+        } else
+#endif
+        {
+            bytes_next = picoquic_format_available_stream_frames(cnx, NULL, bytes_next, bytes_max, UINT64_MAX,
+                                                                 &more_data, &is_pure_ack, &stream_tried_and_failed, &ret);
+        }
+
 
         length = bytes_next - bytes;
 
@@ -2986,8 +3022,8 @@ static uint8_t* picoquic_prepare_datagram_ready(picoquic_cnx_t* cnx, picoquic_pa
 */
 
 static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoquic_path_t* path_x, uint8_t* bytes_next, uint8_t* bytes_max,
-    int is_first_in_packet, uint64_t max_priority_allowed, uint64_t current_time,
-    int* more_data, int* is_pure_ack, int* no_data_to_send, int* ret)
+                                                      int is_first_in_packet, uint64_t max_priority_allowed, uint64_t current_time,
+                                                      int* more_data, int* is_pure_ack, int* no_data_to_send, int* ret)
 {
     int datagram_sent = 0;
     int datagram_tried_and_failed = 0;
@@ -3001,7 +3037,7 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
         * packet is full or there is nothing more to send. */
         uint64_t datagram_present = cnx->first_datagram != NULL || cnx->is_datagram_ready || path_x->is_datagram_ready;
         picoquic_stream_head_t* first_stream = picoquic_find_ready_stream_path(cnx,
-            (cnx->is_multipath_enabled) ? path_x : NULL, 0);
+                                                                               (cnx->is_multipath_enabled) ? path_x : NULL, 0);
         picoquic_packet_t* first_repeat = picoquic_first_data_repeat_packet(cnx);
         uint64_t current_priority = UINT64_MAX;
         uint64_t stream_priority = UINT64_MAX;
@@ -3036,7 +3072,7 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
             cnx->datagram_priority == current_priority &&
             (cnx->datagram_priority < stream_priority || datagram_first)) {
             bytes_next = picoquic_prepare_datagram_ready(cnx, path_x, bytes_next, bytes_max, is_first_in_packet,
-                &more_data_this_round, is_pure_ack, &datagram_tried_and_failed, &datagram_sent, ret);
+                                                         &more_data_this_round, is_pure_ack, &datagram_tried_and_failed, &datagram_sent, ret);
             something_sent = datagram_sent;
         }
 
@@ -3044,7 +3080,7 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
             uint8_t* bytes_first = bytes_next;
             if (bytes_next + 8 < bytes_max) {
                 bytes_next = picoquic_copy_stream_frames_for_retransmit(cnx, bytes_next, bytes_max,
-                    UINT64_MAX, &more_data_this_round, is_pure_ack);
+                                                                        UINT64_MAX, &more_data_this_round, is_pure_ack);
                 if (bytes_next > bytes_first) {
                     cnx->datagram_conflicts_count = 0;
                     something_sent = 1;
@@ -3062,7 +3098,7 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
             uint8_t* bytes_first = bytes_next;
             if (bytes_next + 8 < bytes_max) {
                 bytes_next = picoquic_format_available_stream_frames(cnx, path_x, bytes_next, bytes_max, UINT64_MAX,
-                    &more_data_this_round, is_pure_ack, &stream_tried_and_failed, ret);
+                                                                     &more_data_this_round, is_pure_ack, &stream_tried_and_failed, ret);
                 if (bytes_next > bytes_first) {
                     cnx->datagram_conflicts_count = 0;
                     something_sent = 1;
@@ -3083,13 +3119,13 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
             cnx->datagram_priority <= stream_priority &&
             !datagram_first) {
             bytes_next = picoquic_prepare_datagram_ready(cnx, path_x, bytes_next, bytes_max, is_first_in_packet,
-                more_data, is_pure_ack, &datagram_tried_and_failed, &datagram_sent, ret);
+                                                         more_data, is_pure_ack, &datagram_tried_and_failed, &datagram_sent, ret);
             something_sent = datagram_sent;
         }
 
         if (is_first_round) {
             *no_data_to_send = ((first_stream == NULL && first_repeat == NULL) || stream_tried_and_failed) &&
-                (!datagram_present || datagram_tried_and_failed);
+                               (!datagram_present || datagram_tried_and_failed);
         }
         is_first_round = 0;
         if (!something_sent) {
@@ -3100,6 +3136,16 @@ static uint8_t* picoquic_prepare_stream_and_datagrams(picoquic_cnx_t* cnx, picoq
 
     return bytes_next;
 }
+
+
+
+
+
+
+
+
+
+
 
 /* Prepare the next packet to send when in one the ready states 
  * Lots of the same code as in the "ready" case, but we deal here with extra
@@ -3124,6 +3170,10 @@ int picoquic_prepare_packet_almost_ready(picoquic_cnx_t* cnx, picoquic_path_t* p
     int more_data = 0;
     int no_data_to_send = 0;
     int is_challenge_padding_needed = 0;
+
+#if PICOQUIC_SBM
+    picoquic_sbm_maybe_replenish(cnx, path_x, current_time);
+#endif
 
     /* Perform amplification prevention check */
     if (!cnx->initial_validated &&
@@ -3303,9 +3353,50 @@ int picoquic_prepare_packet_almost_ready(picoquic_cnx_t* cnx, picoquic_path_t* p
                                 bytes_next = picoquic_format_ack_frequency_frame(cnx, bytes_next, bytes_max, &more_data);
                             }
                             if (ret == 0) {
-                                bytes_next = picoquic_prepare_stream_and_datagrams(cnx, path_x, bytes_next, bytes_max,
-                                    (size_t)(bytes_next - bytes) <= packet->offset, UINT64_MAX, current_time,
-                                    &more_data, &is_pure_ack, &no_data_to_send, &ret);
+                                /* right after you computed packet->ptype / epoch for this segment: */
+                                DBG_PRINTF("SEG: ptype=%d state=%d hs=%d\n",
+                                           (int)packet->ptype, (int)cnx->cnx_state,
+                                           (int)(cnx->is_handshake_finished != 0));
+
+/* --- SBM cap around app formatter (STREAM/DATAGRAM) --- */
+#if PICOQUIC_SBM
+
+
+                                const int in_app = picoquic_sbm_in_app_phase(cnx); /* 1-RTT, or accepted 0-RTT for client */
+
+                                if (!in_app) {
+                                    /* Handshake/Initial: skip app scheduler; CRYPTO/ACK/control still proceed. */
+                                } else if (cnx->sbm_enabled && cnx->sbm_pacing_blocked_hint) {
+                                    /* App phase, but pacing says “no app in this packet”: skip. */
+                                } else if (cnx->sbm_enabled) {
+                                    size_t cap = picoquic_sbm_allowed_now(cnx, path_x, (size_t)(bytes_max - bytes_next));
+                                    if (cap > 0) {
+                                        uint8_t* app_bytes_max = bytes_next + cap;
+                                        bytes_next = picoquic_prepare_stream_and_datagrams(
+                                                cnx, path_x, bytes_next, app_bytes_max,
+                                                (size_t)(bytes_next - bytes) <= packet->offset, UINT64_MAX, current_time,
+                                                &more_data, &is_pure_ack, &no_data_to_send, &ret);
+                                    }
+                                } else {
+                                    /* SBM disabled */
+                                    bytes_next = picoquic_prepare_stream_and_datagrams(
+                                            cnx, path_x, bytes_next, bytes_max,
+                                            (size_t)(bytes_next - bytes) <= packet->offset, UINT64_MAX, current_time,
+                                            &more_data, &is_pure_ack, &no_data_to_send, &ret);
+                                }
+
+
+#else
+                                /* No SBM: only call scheduler when in app phase */
+if (picoquic_sbm_in_app_phase(cnx)) {
+    bytes_next = picoquic_prepare_stream_and_datagrams(
+        cnx, path_x, bytes_next, bytes_max,
+        (size_t)(bytes_next - bytes) <= packet->offset,
+        UINT64_MAX, current_time,
+        &more_data, &is_pure_ack, &no_data_to_send, &ret);
+}
+#endif
+/* --- end SBM cap --- */
                             }
                             /* TODO: replace this by posting of frame when CWIN estimated */
                             /* Send bdp frames if there are no stream frames to send
@@ -3913,7 +4004,9 @@ int picoquic_prepare_segment(picoquic_cnx_t* cnx, picoquic_path_t* path_x, picoq
     cnx->cwin_blocked = 0;
     cnx->flow_blocked = 0;
     cnx->stream_blocked = 0;
-
+#if PICOQUIC_SBM
+    cnx->sbm_pacing_blocked_hint = 0;
+#endif
     /* Prepare header -- depend on connection state */
     /* TODO: 0-RTT work. */
     switch (cnx->cnx_state) {
@@ -3968,6 +4061,29 @@ int picoquic_prepare_segment(picoquic_cnx_t* cnx, picoquic_path_t* path_x, picoq
         ret = PICOQUIC_ERROR_UNEXPECTED_STATE;
         break;
     }
+
+
+/* If we didn’t add any bytes because pacer == 0, schedule a timed wake. */
+#if PICOQUIC_SBM
+    if (cnx->sbm_enabled &&
+        picoquic_sbm_in_app_phase(cnx) &&
+        cnx->sbm_pacing_blocked_hint &&
+        !sbm_is_inf(cnx->sbm_remaining_bytes_tick) &&
+        cnx->sbm_remaining_bytes_tick == 0) {
+
+        uint64_t wake = current_time + (uint64_t)cnx->sbm_replenish_time_ms * 1000ULL;
+        if (*next_wake_time > wake) {
+            *next_wake_time = wake;
+            SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+        }
+
+        picoquic_reinsert_by_wake_time(cnx->quic, cnx, wake);
+
+        DBG_PRINTF("[SBM/WAKE2] no progress (pace==0), wake in %u ms\n",
+                   (unsigned)cnx->sbm_replenish_time_ms);
+    }
+#endif
+
 
     return ret;
 }
@@ -4147,12 +4263,13 @@ static inline int picoquic_app_streams_pending(const picoquic_cnx_t* cnx)
 
 /* Prepare next packet to send, or nothing.. */
 int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
-    uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,
-    struct sockaddr_storage * p_addr_to, struct sockaddr_storage * p_addr_from, int* if_index, size_t* send_msg_size)
+                               uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,
+                               struct sockaddr_storage * p_addr_to, struct sockaddr_storage * p_addr_from, int* if_index, size_t* send_msg_size)
 {
     uint64_t next_wake_time;
     int ret = picoquic_handle_send_timers(cnx, current_time, &next_wake_time);
     *send_length = 0;
+    int sbm_delayed_wake = 0; /* set when SBM asks us to wake later */
 
     if (send_buffer_max < PICOQUIC_ENFORCED_INITIAL_MTU) {
         DBG_PRINTF("Invalid buffer size: %zu", send_buffer_max);
@@ -4166,37 +4283,41 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
         size_t coalesced_packet_size = 0;
 
         picoquic_handle_send_paths(cnx, current_time, &next_wake_time,
-            &path_x, &tuple, p_addr_to, p_addr_from, if_index,
-            send_buffer_max, send_msg_size);
+                                   &path_x, &tuple, p_addr_to, p_addr_from, if_index,
+                                   send_buffer_max, send_msg_size);
         initial_next_time = next_wake_time;
 
 #if PICOQUIC_SBM
         if (cnx->sbm_enabled) {
-            /* If there is no app data to pace, or CRYPTO is pending, make SBM inert. */
-            if (!picoquic_app_streams_pending(cnx) || picoquic_crypto_pending(cnx)) {
-                cnx->sbm_remaining_bytes_tick = UINT64_MAX;  /* unlimited for this call */
-                /* Don’t touch tokens, don’t schedule token-based wakeups, don’t log. */
+            const int in_app   = picoquic_sbm_in_app_phase(cnx);
+            const int str_pend = picoquic_app_streams_pending(cnx);
+            const int dgm_pend = picoquic_datagrams_pending_globally(cnx);
+            const int app_pend = (str_pend || dgm_pend);
+
+            if (!in_app || !app_pend) {
+                /* No app work: make SBM inert and do not mark blocked. */
+                cnx->sbm_remaining_bytes_tick = SBM_INF;
+                cnx->sbm_pacing_blocked_hint  = 0;
+                /* (Optional) skip printing [SBM/TICK] here. */
             } else {
-                /* === normal SBM accounting for app streams only === */
-                picoquic_path_t* sp = path_x;
+                /* === normal SBM accounting (your existing rate/tokens/bucket logic) === */
+                picoquic_path_t* sp = path_x ? path_x : cnx->path[0];
 
+                uint64_t rtt_us = (sp && sp->smoothed_rtt > 0) ? sp->smoothed_rtt : 1000;
+                uint64_t from_cwnd  = (sp && sp->cwin > 0) ? (sp->cwin / rtt_us) : 0;
+                uint64_t from_pacer = (sp && sp->pacing.rate > 0) ? (sp->pacing.rate / 8 / 1000000ULL) : 0;
 
-                uint64_t rtt_us = (sp->smoothed_rtt > 0) ? sp->smoothed_rtt : 1000;
-                uint64_t rate_bytes_per_us_from_cwnd  = (sp->cwin > 0) ? (sp->cwin / rtt_us) : 0;
-                uint64_t rate_bytes_per_us_from_pacer = (sp->pacing.rate > 0) ? (sp->pacing.rate / 8 / 1000000ULL) : 0;
-
-                uint64_t new_rate = rate_bytes_per_us_from_pacer;
-                if (new_rate == 0 || new_rate < rate_bytes_per_us_from_cwnd) new_rate = rate_bytes_per_us_from_cwnd;
+                uint64_t new_rate = (from_pacer == 0 || from_pacer < from_cwnd) ? from_cwnd : from_pacer;
                 if (new_rate == 0) {
-                    uint64_t mtu = (sp->send_mtu ? sp->send_mtu : 1200);
-                    new_rate = mtu / 1000ULL; /* ~1 MTU / ms fallback */
+                    uint64_t mtu = (sp && sp->send_mtu ? sp->send_mtu : 1200);
+                    new_rate = mtu / 1000ULL;
                     if (new_rate == 0) new_rate = 1;
                 }
                 cnx->sbm_rate_bytes_per_us = new_rate;
 
-                uint64_t observed_mtu = (sp->send_mtu ? sp->send_mtu : 1200);
+                uint64_t observed_mtu = (sp && sp->send_mtu ? sp->send_mtu : 1200);
                 uint64_t target_bucket = 8ULL * observed_mtu;
-                uint64_t cwnd_cap      = sp->cwin / 4;
+                uint64_t cwnd_cap      = sp ? (sp->cwin / 4) : 0;
                 if (cwnd_cap > 0 && target_bucket > cwnd_cap) target_bucket = cwnd_cap;
                 if (target_bucket < 2ULL * observed_mtu) target_bucket = 2ULL * observed_mtu;
                 cnx->sbm_bucket_max = target_bucket;
@@ -4214,63 +4335,53 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
                     cnx->sbm_last_refill_time = now;
                 }
 
-                uint64_t budget_cap = picoquic_sbm_budget_bytes(cnx, sp);
-                uint64_t headroom   = (budget_cap > cnx->sbm_unsent_bytes) ? (budget_cap - cnx->sbm_unsent_bytes) : 0;
-                cnx->sbm_remaining_bytes_tick = (cnx->sbm_tokens < headroom) ? cnx->sbm_tokens : headroom;
-
-                const int stalled = (cnx->sbm_remaining_bytes_tick == 0 && headroom == 0);
-
-                if (stalled) {
-                    if (cnx->sbm_last_stall_time == current_time) {
-                        if (++cnx->sbm_stall_spins >= 16) {  /* seen this ~16 times at same time -> bail */
-                            uint64_t wake = current_time + 1000; /* 1 ms nudge so simulator/timewheel can advance */
-                            if (wake < next_wake_time) {
-                                next_wake_time = wake;
-                                SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
-                            }
-                            cnx->sbm_stall_spins = 0; /* reset for next round */
-                            picoquic_reinsert_by_wake_time(cnx->quic, cnx, next_wake_time);
-                            *send_length = 0;
-                            return 0;  /* graceful “no packet” exit; test loop will move on */
-                        }
-                    } else {
-                        cnx->sbm_last_stall_time = current_time;
-                        cnx->sbm_stall_spins = 1;
-                    }
+                /* Headroom (backlog limit) */
+                uint64_t headroom;
+                if (cnx->sbm_max_unsent_bytes == 0 || sbm_is_inf(cnx->sbm_max_unsent_bytes)) {
+                    headroom = SBM_INF;
+                } else if (cnx->sbm_unsent_bytes >= cnx->sbm_max_unsent_bytes) {
+                    headroom = 0;
                 } else {
-                    cnx->sbm_stall_spins = 0;
-                    cnx->sbm_last_stall_time = 0;
+                    headroom = cnx->sbm_max_unsent_bytes - cnx->sbm_unsent_bytes;
                 }
 
-                /* Debug only when pacing app data*/
-                DBG_PRINTF("[SBM/TICK] t=%llu tokens=%llu rem=%llu headroom=%llu rate=%lluB/s cwin=%llu rtt_us=%llu\n",
-                        (unsigned long long)now,
-                        (unsigned long long)cnx->sbm_tokens,
-                        (unsigned long long)cnx->sbm_remaining_bytes_tick,
-                        (unsigned long long)headroom,
-                        (unsigned long long)(cnx->sbm_rate_bytes_per_us * 1000000ULL),
-                        (unsigned long long)sp->cwin,
-                        (unsigned long long)rtt_us);
+                uint64_t tokens = picoquic_sbm_budget_bytes(cnx, sp);
+                cnx->sbm_remaining_bytes_tick =
+                        (headroom == 0) ? 0 : ((tokens < headroom) ? tokens : headroom);
 
-                /* (optional) keep your “wake when tokens < MTU” here – but only in this branch */
+                if (cnx->sbm_remaining_bytes_tick != SBM_INF &&
+                    cnx->sbm_remaining_bytes_tick > 0 &&
+                    str_pend && /* streams pending only */
+                    cnx->sbm_remaining_bytes_tick < 1200) {
+                    cnx->sbm_remaining_bytes_tick = 1200; /* ensure ≥1 MTU when app pending */
+                }
+
+                /* Optional debug: */
+                DBG_PRINTF("[SBM/TICK] t=%llu tokens=%llu rem=%llu rate=%lluB/s cwin=%llu rtt_us=%llu\n",
+                           (unsigned long long)now,
+                           (unsigned long long)cnx->sbm_tokens,
+                           (unsigned long long)cnx->sbm_remaining_bytes_tick,
+                           (unsigned long long)(cnx->sbm_rate_bytes_per_us*1000000ULL),
+                           (unsigned long long)(sp?sp->cwin:0ULL),
+                           (unsigned long long)rtt_us);
             }
         }
 #endif
 
+
         while (ret == 0)
         {
+            /* ===== NEW PACKET BOUNDARY ===== */
+            /* Allow exactly one DATAGRAM scheduling phase in this packet */
+            cnx->dgram_ok_this_packet = 1;
+
             /* Create a new packet, which may include several segments */
             int is_initial_sent = 0;
             size_t packet_max = send_buffer_max - *send_length;
             uint8_t* packet_buffer = send_buffer + *send_length;
 
             coalesced_packet_size = 0;
-#if TODO
-            if (if_index == PICOQUIC_RESERVED_IF_INDEX && quic->proxy_ctx) {
-                /* Reset the max packet size to what can be absorbed by the proxy connection. */
-                /* This may become more complicated if we support multiple encapsulations. */
-            }
-#endif
+
             /* Reset the wake time to the initial value after sending packets */
             next_wake_time = initial_next_time;
 
@@ -4280,70 +4391,100 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
                 packet_max = *send_msg_size;
             }
 
+#if PICOQUIC_SBM
+            /* === SBM: per-packet app gate (POST-HANDSHAKE ONLY) =================== */
+            if (cnx->sbm_enabled) {
+                /*const int hs_done = cnx->is_handshake_finished;
+                const int allow_appish =
+                        hs_done ||
+                        (cnx->crypto_context[picoquic_epoch_1rtt].aead_encrypt != NULL) ||
+                        (cnx->client_mode && cnx->zero_rtt_data_accepted &&
+                         cnx->crypto_context[picoquic_epoch_0rtt].aead_encrypt != NULL);*/
+
+                if (picoquic_sbm_in_app_phase(cnx)) {
+                    picoquic_path_t *p = path_x ? path_x : cnx->path[0];
+                    uint64_t cc_headroom = (p && p->cwin > p->bytes_in_transit) ? (p->cwin - p->bytes_in_transit) : 0;
+                    uint64_t pace_rem   = cnx->sbm_remaining_bytes_tick;
+
+                    /* Pace app frames only; never block CRYPTO/ACK builders */
+                    if (pace_rem == 0 || cc_headroom == 0) {
+                        uint64_t now = picoquic_get_quic_time(cnx->quic);
+                        uint64_t dt  = (uint64_t)(cnx->sbm_replenish_time_ms ? cnx->sbm_replenish_time_ms : 25) * 1000ull;
+                        if (next_wake_time > now + dt) {
+                            next_wake_time = now + dt;
+                            SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+                        }
+                        cnx->sbm_pacing_blocked_hint = 1;
+                        sbm_delayed_wake = 1;                  /* <-- remember we scheduled a delayed wake */
+                    } else {
+                        cnx->sbm_pacing_blocked_hint = 0;
+                    }
+                } else {
+                    cnx->sbm_pacing_blocked_hint = 0; /* handshake phase */
+                }
+            }
+#endif
+
             /* Send the available segments in that packet. */
             while (ret == 0)
             {
-                /* Create the segments that fit in the new packet */
                 size_t available = packet_max;
                 size_t segment_length = 0;
                 picoquic_packet_t* packet = NULL;
 
                 if (coalesced_packet_size > 0) {
-                    packet_max = path_x->send_mtu;
+                    /* enforce MTU for additional segments in same packet */
+                    size_t mtu = path_x && path_x->send_mtu ? path_x->send_mtu : PICOQUIC_ENFORCED_INITIAL_MTU;
+                    packet_max = mtu;
 
                     if (packet_max < coalesced_packet_size + PICOQUIC_MIN_SEGMENT_SIZE) {
                         break;
-                    }
-                    else {
+                    } else {
                         available = packet_max - coalesced_packet_size;
                     }
                 }
 
                 packet = picoquic_create_packet(cnx->quic);
-
                 if (packet == NULL) {
                     ret = PICOQUIC_ERROR_MEMORY;
                     break;
                 }
-                else {
-                    if (tuple != path_x->first_tuple) {
-                        ret = picoquic_prepare_path_control_packet(cnx, path_x, tuple,
-                            packet, current_time, 
-                            send_buffer, send_buffer_max, send_length,
-                            &next_wake_time);
-                    }
-                    else {
-                        ret = picoquic_prepare_segment(cnx, path_x, packet, current_time,
-                            packet_buffer + coalesced_packet_size, available, &segment_length, &next_wake_time, &is_initial_sent);
-                    }
 
-                    if (ret == 0) {
-                        coalesced_packet_size += segment_length;
-                        if (packet->length == 0) {
-                            /* Nothing more to send */
-                            picoquic_recycle_packet(cnx->quic, packet);
-                            break;
-                        }
-                        else if (packet->ptype == picoquic_packet_1rtt_protected) {
-                            /* Cannot coalesce packets after 1 rtt packet */
-                            break;
-                        }
-                        else if (segment_length == 0) {
-                            DBG_PRINTF("Send bug: segment length = %zu, packet length = %zu\n", segment_length, packet->length);
-                            break;
-                        }
-                    }
-                    else {
+                if (tuple != path_x->first_tuple) {
+                    ret = picoquic_prepare_path_control_packet(cnx, path_x, tuple,
+                                                               packet, current_time,
+                                                               send_buffer, send_buffer_max, send_length,
+                                                               &next_wake_time);
+                } else {
+                    ret = picoquic_prepare_segment(cnx, path_x, packet, current_time,
+                                                   packet_buffer + coalesced_packet_size, available, &segment_length, &next_wake_time, &is_initial_sent);
+                }
+
+                if (ret == 0) {
+                    coalesced_packet_size += segment_length;
+                    if (packet->length == 0) {
+                        /* Nothing more to send */
                         picoquic_recycle_packet(cnx->quic, packet);
-                        if (coalesced_packet_size != 0) {
-                            ret = 0;
-                        }
-                        break;
-                    }
 
-                    if (cnx->quic->dont_coalesce_init || tuple != path_x->first_tuple) {
+                        break;
+                    } else if (packet->ptype == picoquic_packet_1rtt_protected) {
+                        /* Cannot coalesce packets after 1 rtt packet */
+                        break;
+                    } else if (segment_length == 0) {
+                        DBG_PRINTF("Send bug: segment length = %zu, packet length = %zu\n",
+                                   segment_length, packet->length);
                         break;
                     }
+                } else {
+                    picoquic_recycle_packet(cnx->quic, packet);
+                    if (coalesced_packet_size != 0) {
+                        ret = 0;
+                    }
+                    break;
+                }
+
+                if (cnx->quic->dont_coalesce_init || tuple != path_x->first_tuple) {
+                    break;
                 }
             }
 
@@ -4351,7 +4492,7 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
                 cnx->cnx_state < picoquic_state_client_handshake_start &&
                 coalesced_packet_size > 0 &&
                 coalesced_packet_size < PICOQUIC_ENFORCED_INITIAL_MTU) {
-                /* This is bad */
+                /* pad Initial */
                 size_t padding = packet_max - coalesced_packet_size;
                 picoquic_public_random(packet_buffer + coalesced_packet_size, padding);
                 coalesced_packet_size += padding;
@@ -4359,64 +4500,60 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
 
             if (coalesced_packet_size > packet_max) {
 #ifdef HUNTING_FOR_BUFFER_OVERFLOW
-                int* x = NULL;
-                *x += 1;
+                int* x = NULL; *x += 1;
 #endif
-                picoquic_log_app_message(cnx, "BUFFER OVERFLOW? Packet size %zu larger than %zu", coalesced_packet_size, packet_max);
+                picoquic_log_app_message(cnx, "BUFFER OVERFLOW? Packet size %zu larger than %zu",
+                                         coalesced_packet_size, packet_max);
             }
+
             if (coalesced_packet_size > 0) {
                 if (coalesced_packet_size > cnx->max_mtu_sent) {
                     cnx->max_mtu_sent = coalesced_packet_size;
                 }
                 cnx->nb_packets_sent++;
-                /* if needed, log that the packet is sent */
+
                 if (p_addr_to != NULL && p_addr_from != NULL) {
                     picoquic_log_pdu(cnx, 0, current_time,
-                        (struct sockaddr*)p_addr_to, (struct sockaddr*)p_addr_from, coalesced_packet_size,
-                        path_x->unique_path_id);
+                                     (struct sockaddr*)p_addr_to, (struct sockaddr*)p_addr_from, coalesced_packet_size,
+                                     path_x ? path_x->unique_path_id : 0);
                 }
             }
 
-            /* Update the wake up time for the connection */
+            /* new: preserve SBM’s delayed wake, if any */
             if (coalesced_packet_size > 0 || cnx->cnx_state == picoquic_state_disconnected) {
-                next_wake_time = current_time;
-                SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+                if (!sbm_delayed_wake) {
+                    next_wake_time = current_time;
+                    SET_LAST_WAKE(cnx->quic, PICOQUIC_SENDER);
+                    /* optional: DBG_PRINTF("[SBM] instant wake (no pacing delay)\n",""); */
+                } else {
+                    /* optional: DBG_PRINTF("[SBM] instant wake suppressed (paced)\n",""); */
+                }
             }
 
-            /* Account for the bytes in the packet. */
             *send_length += coalesced_packet_size;
 
-            if (*if_index == PICOQUIC_RESERVED_IF_INDEX && *send_length > 0 && cnx->quic->picomask_ctx != NULL && cnx->quic->picomask_fns != NULL) {
-                /* Ask the proxy to handle the packet */
-                /* if we queue it as a datagram, set packet_size to 0 */
-                /* If we can do some short cut, rewrite the packet in place per shortcut spec. */
+            if (*if_index == PICOQUIC_RESERVED_IF_INDEX &&
+                *send_length > 0 && cnx->quic->picomask_ctx != NULL && cnx->quic->picomask_fns != NULL) {
                 ret = (cnx->quic->picomask_fns->picomask_intercept_fn)
-                    (cnx->quic, cnx->quic->picomask_ctx, current_time, send_buffer, send_length, send_msg_size,
-                    p_addr_to, p_addr_from, if_index);
-                if (ret == 0) {
-
-                }
-
+                        (cnx->quic, cnx->quic->picomask_ctx, current_time, send_buffer, send_length, send_msg_size,
+                         p_addr_to, p_addr_from, if_index);
                 if (ret < 0 || *send_length == 0) {
                     break;
                 }
             }
 
-            /* Check whether to keep coalescing multiple packets in the send buffer */
+            /* Coalescing policy */
             if (send_msg_size == NULL) {
                 break;
-            }
-            else if (coalesced_packet_size > *send_msg_size) {
-                /* This can only happen for the first packet in a batch. */
+            } else if (coalesced_packet_size > *send_msg_size) {
                 *send_msg_size = coalesced_packet_size;
-            }
-            else if (coalesced_packet_size != *send_msg_size) {
+            } else if (coalesced_packet_size != *send_msg_size) {
+                break;
+            } else if (*send_length + *send_msg_size > send_buffer_max) {
                 break;
             }
-            else if (*send_length + *send_msg_size > send_buffer_max) {
-                break;
-            }
-        }
+        } /* end outer while (ret == 0) packet loop */
+
         if (*send_length > 0) {
             picoquic_handle_send_train_statistics(cnx, path_x, coalesced_packet_size, send_length, send_msg_size);
         }
@@ -4427,19 +4564,11 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
     }
 
 #if PICOQUIC_SBM
-    /* -------- SECOND safety net: if we didn’t send and tokens are the limiter, schedule a wake -------- */
+    /* SECOND safety net: if tokens are the limiter and app wants to send, schedule a wake */
     if (cnx->sbm_enabled && picoquic_app_streams_pending(cnx)) {
-        /* Choose the same path we just used for MTU/rate context */
-        int path_id2 = 0;
-        uint64_t observed_mtu2 = (cnx->path[path_id2]->send_mtu ?
-                                  #ifdef PICOQUIC_ENFORCED_INITIAL_MTU
-                                  cnx->path[path_id2]->send_mtu : PICOQUIC_ENFORCED_INITIAL_MTU
-#else
-                cnx->path[path_id2]->send_mtu : 1200
-#endif
-        );
-        /* If the app wants to send and flow control permits, but tokens are short, wake when they refill */
-        uint64_t budget_cap2 = picoquic_sbm_budget_bytes(cnx, cnx->path[path_id2]);
+        picoquic_path_t* p2 = cnx->path[0];
+        uint64_t observed_mtu2 = (p2 && p2->send_mtu) ? p2->send_mtu : 1200;
+        uint64_t budget_cap2 = picoquic_sbm_budget_bytes(cnx, p2);
         uint64_t headroom2 = (budget_cap2 > cnx->sbm_unsent_bytes) ? (budget_cap2 - cnx->sbm_unsent_bytes) : 0;
         int app_wants_send2 = (cnx->first_output_stream != NULL) || (cnx->sbm_unsent_bytes > 0);
 
@@ -4458,9 +4587,9 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
 #endif
 
     picoquic_reinsert_by_wake_time(cnx->quic, cnx, next_wake_time);
-
     return ret;
 }
+
 
 int picoquic_prepare_packet(picoquic_cnx_t* cnx,
     uint64_t current_time, uint8_t* send_buffer, size_t send_buffer_max, size_t* send_length,

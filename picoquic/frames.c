@@ -1442,15 +1442,15 @@ picoquic_stream_head_t* picoquic_find_ready_stream_path(picoquic_cnx_t* cnx, pic
             }
         }
 #if PICOQUIC_SBM
-        if (cnx->sbm_enabled && stream->is_active) {
+        if (cnx->sbm_enabled && stream->is_active && !stream->fin_requested && !stream->fin_received && !stream->fin_sent) {
             size_t allowed = (size_t) cnx->sbm_remaining_bytes_tick;
             if (allowed == 0) {
                 /* Hard Cheshire: skip fetching fresh app data this round */
                 stream = next_stream; /* your local label / flow */
                 continue;
             }
+        //comes here every time
 
-            //if (stream->maxdata_remote > allowed) stream->maxdata_remote = allowed; /* clamp the hint */
         }
 #endif
         stream = next_stream;
@@ -1723,12 +1723,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
         if ((bytes = picoquic_format_stream_frame_header(bytes, bytes_max, stream->stream_id, stream->sent_offset)) == NULL) {
             bytes = bytes0;
             if (more_data) *more_data = 1;
-#if PICOQUIC_SBM
-            if (cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
-                /* We couldn’t place data now: stop trying this tick */
+/*#if PICOQUIC_SBM
+            if (cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != SBM_INF) {
+                *//* We couldn’t place data now: stop trying this tick *//*
                 cnx->sbm_remaining_bytes_tick = 0;
             }
-#endif
+#endif*/
             goto stream_done;
         } else {
             /* Compute the length */
@@ -1752,12 +1752,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
             if (allowed_space == 0) {
                 bytes = bytes0;
                 if (more_data) *more_data = 1;
-#if PICOQUIC_SBM
-                if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
-                    /* We couldn’t place data now: stop trying this tick */
+/*#if PICOQUIC_SBM
+                if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != SBM_INF) {
+                    *//* We couldn’t place data now: stop trying this tick *//*
                     cnx->sbm_remaining_bytes_tick = 0;
                 }
-#endif
+#endif*/
                 goto stream_done;
             }
 
@@ -1767,9 +1767,15 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                 if (cnx->sbm_enabled) {
                     uint64_t allow = cnx->sbm_remaining_bytes_tick;
                     if (allow == 0) {
-                        /* Don’t emit a STREAM frame header-only; drop it and try later */
+                        /* Don’t emit a STREAM header-only; back out and try later */
                         bytes = bytes0;
+
+                        /* IMPORTANT: signal backlog so the caller schedules a wake */
                         if (more_data) *more_data = 1;
+
+                        /* Do NOT set any sticky “skip app” hint here */
+                        cnx->sbm_pacing_blocked_hint = 1;  // remove any writes to this
+
                         goto stream_done;
                     }
                     if (allowed_space > allow) {
@@ -1800,12 +1806,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                     *ret = picoquic_connection_error_ex(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0,
                         "Prepare to send callback");
                     bytes = bytes0; /* CHECK: SHOULD THIS BE NULL ? */
-#if PICOQUIC_SBM
-                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
-                        /* We couldn’t place data now: stop trying this tick */
+/*#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != SBM_INF) {
+                        *//* We couldn’t place data now: stop trying this tick *//*
                         cnx->sbm_remaining_bytes_tick = 0;
                     }
-#endif
+#endif*/
                     goto stream_done;
                 }
                 else if (stream_data_context.length == 0 && stream_data_context.is_fin == 0) {
@@ -1813,12 +1819,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                     bytes = bytes0;
                     stream->is_active = stream_data_context.is_still_active;
                     if (more_data) *more_data = 1;
-#if PICOQUIC_SBM
-                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
-                        /* We couldn’t place data now: stop trying this tick */
+/*#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != SBM_INF) {
+                        *//* We couldn’t place data now: stop trying this tick *//*
                         cnx->sbm_remaining_bytes_tick = 0;
                     }
-#endif
+#endif*/
                     goto stream_done;
                 }
                 else
@@ -1916,12 +1922,12 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
                     /* No point in sending a silly packet */
                     bytes = bytes0;
                     if (more_data) *more_data = 1;
-#if PICOQUIC_SBM
-                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != UINT64_MAX) {
-                        /* We couldn’t place data now: stop trying this tick */
+/*#if PICOQUIC_SBM
+                    if (sbm_app_now && cnx->sbm_enabled && cnx->sbm_remaining_bytes_tick != SBM_INF) {
+                        *//* We couldn’t place data now: stop trying this tick *//*
                         cnx->sbm_remaining_bytes_tick = 0;
                     }
-#endif
+#endif*/
                     goto stream_done;
                 }
             }
@@ -1941,24 +1947,28 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
         /* === CHESHIRE: spend per-tick allowance; shrink unsent only for buffered === */
 #if PICOQUIC_SBM
         if (cnx->sbm_enabled && payload_len > 0) {
-            if (cnx->sbm_remaining_bytes_tick >= payload_len)
-                cnx->sbm_remaining_bytes_tick -= payload_len;
-            else
-                cnx->sbm_remaining_bytes_tick = 0;
-
-            if (from_buffer) { /* DO NOT touch sbm_unsent_bytes for JIT */
-                if (cnx->sbm_unsent_bytes >= payload_len)
-                    cnx->sbm_unsent_bytes -= payload_len;
-                else
-                    cnx->sbm_unsent_bytes = 0;
+            /* Spend per-tick allowance — but never mutate the INF sentinel */
+            if (!sbm_is_inf(cnx->sbm_remaining_bytes_tick)) {
+                if (cnx->sbm_remaining_bytes_tick >= payload_len)
+                    cnx->sbm_remaining_bytes_tick -= payload_len;
+                //else
+                    //cnx->sbm_remaining_bytes_tick = 0;
             }
 
-            /* Optional debug:*/
-            DBG_PRINTF("[SBM/FRAME-] stream=%" PRIu64 " len=%zu rem=%llu unsent=%llu\n",
-                (uint64_t)stream->stream_id, (size_t)payload_len,
-                (unsigned long long)cnx->sbm_remaining_bytes_tick,
-                (unsigned long long)cnx->sbm_unsent_bytes);
+            if (from_buffer) {
+                if (cnx->sbm_unsent_bytes >= payload_len)
+                    cnx->sbm_unsent_bytes -= payload_len;
+                //else
+                    //cnx->sbm_unsent_bytes = 0;
+            }
 
+            /* Debug: print 0 for INF to avoid scary values */
+            uint64_t rem_dbg = sbm_is_inf(cnx->sbm_remaining_bytes_tick) ? 0 : cnx->sbm_remaining_bytes_tick;
+
+            DBG_PRINTF("[SBM/FRAME-] stream=%" PRIu64 " len=%zu rem=%llu unsent=%llu\n",
+                       (uint64_t)stream->stream_id, (size_t)payload_len,
+                       (unsigned long long)rem_dbg,
+                       (unsigned long long)cnx->sbm_unsent_bytes);
         }
 #endif
         /* === end === */
@@ -1972,43 +1982,70 @@ uint8_t * picoquic_format_stream_frame(picoquic_cnx_t* cnx, picoquic_stream_head
  * Update is_pure_ack if formated frames require ack
  * Set stream_tried_and_failed if there was nothing to send, indicating the app limited condition.
  */
-uint8_t* picoquic_format_available_stream_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x, uint8_t* bytes_next, uint8_t* bytes_max,
-    uint64_t current_priority, int* more_data,
-    int* is_pure_ack, int* stream_tried_and_failed, int* ret)
+uint8_t* picoquic_format_available_stream_frames(picoquic_cnx_t* cnx, picoquic_path_t * path_x,
+                                                 uint8_t* bytes_next, uint8_t* bytes_max, uint64_t current_priority,
+                                                 int* more_data, int* is_pure_ack, int* stream_tried_and_failed, int* ret)
 {
     uint8_t* bytes_previous = bytes_next;
-    picoquic_stream_head_t* stream = picoquic_find_ready_stream_path(cnx,
-        (cnx->is_multipath_enabled)?path_x: NULL, 0);
+    picoquic_stream_head_t* stream = picoquic_find_ready_stream_path(
+            cnx, (cnx->is_multipath_enabled) ? path_x : NULL, 0);
     int more_stream_data = 0;
 
     while (*ret == 0 && stream != NULL && stream->stream_priority <= current_priority && bytes_next < bytes_max) {
         int is_still_active = 0;
-        bytes_next = picoquic_format_stream_frame(cnx, stream, bytes_next, bytes_max, &more_stream_data, is_pure_ack, &is_still_active, ret);
+        /* remember where this stream started, so we can tell if we wrote anything */
+        uint8_t* stream_start = bytes_next;
 
-        /* TODO: if stream is marked "no_coal", do not add anything */
-        if (*ret == 0 && !stream->is_not_coalesced) {
-            stream = picoquic_find_ready_stream_path(cnx,
-                (cnx->is_multipath_enabled)?path_x: NULL, 1);
-            if (stream != NULL && bytes_next + 17 >= bytes_max) {
-                more_stream_data = 1;
-                break;
+        bytes_next = picoquic_format_stream_frame(
+                cnx, stream, bytes_next, bytes_max, &more_stream_data, is_pure_ack, &is_still_active, ret);
+
+        if (*ret != 0) break;
+
+        int wrote_from_this_stream = (bytes_next > stream_start);
+
+        /* If we didn’t place data because pacing tokens ran out, surface “more data pending”
+   so the caller keeps us runnable and/or schedules a timed wake. */
+#if PICOQUIC_SBM
+        if (cnx->sbm_enabled &&
+            picoquic_sbm_in_app_phase(cnx) &&
+            cnx->sbm_pacing_blocked_hint) {
+            more_stream_data = 1;
+            break;
+        }
+#endif
+
+        /* If stream is marked "no_coalesced":
+           - If we wrote bytes from it, stop coalescing (respect barrier).
+           - If we wrote nothing (pacing/FC blocked), SKIP it and try the next ready stream. */
+        if (stream->is_not_coalesced) {
+            if (wrote_from_this_stream) {
+                break; /* we emitted from this stream; do not coalesce others */
+            } else {
+                /* nothing emitted; try the next stream at same priority */
+                stream = picoquic_find_ready_stream_path(
+                        cnx, (cnx->is_multipath_enabled) ? path_x : NULL, 1);
+                continue;
             }
         }
-        else {
+
+        /* Coalescing allowed: fetch next stream and check there’s room for another header */
+        stream = picoquic_find_ready_stream_path(
+                cnx, (cnx->is_multipath_enabled) ? path_x : NULL, 1);
+
+        if (stream != NULL && bytes_next + 17 >= bytes_max) {
+            more_stream_data = 1; /* not enough room for another STREAM header */
             break;
         }
     }
 
     *stream_tried_and_failed = (!more_stream_data && bytes_next == bytes_previous);
 
-    if (!more_stream_data && current_priority != UINT64_MAX) {
-        more_stream_data |= (picoquic_find_ready_stream_path(cnx, NULL, 0) != NULL);
-    }
+
 
     *more_data |= more_stream_data;
-
     return bytes_next;
 }
+
 
 /* Organize the queue of packets containing stream data as a splay.
 * TODO: replace cnx->data_repeat_last and cnx->data_repeat_first by
