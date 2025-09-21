@@ -360,7 +360,7 @@ int bbr_one_second_test()
  * Verify that 10MB can be downloaded very fast on a low latency Gbps link. */
 int gbps_performance_test()
 {
-    uint64_t max_completion_time = 550000;
+    uint64_t max_completion_time = 250000;
     uint64_t latency = 4000;
     uint64_t jitter = 2000;
     uint64_t buffer = 2 * (latency + jitter);
